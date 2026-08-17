@@ -2790,17 +2790,20 @@ static QUIC_STATUS wtf_handle_stream_receive(wtf_http3_stream* stream, HQUIC Str
 {
     wtf_connection* conn = stream->connection;
 
-    uint64_t stream_id;
-    uint32_t stream_id_size = sizeof(stream_id);
-    QUIC_STATUS status = conn->context->quic_api->GetParam(
-        Stream, QUIC_PARAM_STREAM_ID, &stream_id_size, &stream_id);
-    if (QUIC_FAILED(status)) {
-        WTF_LOG_ERROR(conn->context, "stream", "Failed to get stream ID for receive: 0x%x",
-                      status);
-        conn->context->quic_api->StreamShutdown(
-            Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND | QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE,
-            WTF_H3_INTERNAL_ERROR);
-        return QUIC_STATUS_SUCCESS;
+    uint64_t stream_id = stream->id;
+    if (stream_id == UINT64_MAX) {
+        uint32_t stream_id_size = sizeof(stream_id);
+        QUIC_STATUS status = conn->context->quic_api->GetParam(
+            Stream, QUIC_PARAM_STREAM_ID, &stream_id_size, &stream_id);
+        if (QUIC_FAILED(status)) {
+            WTF_LOG_ERROR(conn->context, "stream", "Failed to get stream ID for receive: 0x%x",
+                          status);
+            conn->context->quic_api->StreamShutdown(
+                Stream,
+                QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND | QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE,
+                WTF_H3_INTERNAL_ERROR);
+            return QUIC_STATUS_SUCCESS;
+        }
     }
 
     if (stream->id == UINT64_MAX) {
@@ -2893,10 +2896,13 @@ static QUIC_STATUS wtf_handle_stream_shutdown_events(wtf_http3_stream* stream, H
                                                      QUIC_STREAM_EVENT* Event)
 {
     wtf_connection* conn = stream->connection;
-    uint64_t stream_id;
-    uint32_t stream_id_size = sizeof(stream_id);
-    QUIC_STATUS status = conn->context->quic_api->GetParam(
-        Stream, QUIC_PARAM_STREAM_ID, &stream_id_size, &stream_id);
+    uint64_t stream_id = stream->id;
+    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    if (stream_id == UINT64_MAX) {
+        uint32_t stream_id_size = sizeof(stream_id);
+        status = conn->context->quic_api->GetParam(
+            Stream, QUIC_PARAM_STREAM_ID, &stream_id_size, &stream_id);
+    }
 
     wtf_http3_stream* stream_to_destroy = NULL;
     bool release_map_ref = false;

@@ -201,6 +201,9 @@ static wtf_connection* wtf_connection_create_common(wtf_context* context, HQUIC 
                                                           : WTF_DEFAULT_MAX_DATA_PER_SESSION;
     atomic_init(&conn->datagram_send_enabled, false);
     atomic_init(&conn->max_datagram_size, 0);
+    for (size_t i = 0; i < WTF_DATAGRAM_SESSION_CACHE_SIZE; i++) {
+        atomic_init(&conn->datagram_session_cache[i], (uintptr_t)NULL);
+    }
 
     wtf_settings_init(&conn->local_settings);
     wtf_settings_init(&conn->peer_settings);
@@ -319,6 +322,10 @@ static void wtf_connection_dispose(wtf_connection* conn)
     conn->destroyed = true;
 
     mtx_lock(&conn->sessions_mutex);
+    for (size_t i = 0; i < WTF_DATAGRAM_SESSION_CACHE_SIZE; i++) {
+        atomic_store_explicit(&conn->datagram_session_cache[i], (uintptr_t)NULL,
+                              memory_order_release);
+    }
     for (session_map_itr itr = session_map_first(&conn->sessions); !session_map_is_end(itr);
          itr = session_map_next(itr)) {
         wtf_session_destroy(itr.data->val);
@@ -692,12 +699,24 @@ QUIC_STATUS QUIC_API wtf_connection_callback(HQUIC Connection, void* Context,
     }
 }
 
-wtf_session* wtf_connection_find_session(wtf_connection* conn, uint64_t session_id)
+wtf_session* wtf_connection_find_session_borrowed(wtf_connection* conn, uint64_t session_id)
 {
     if (!conn || conn->destroyed)
         return NULL;
 
+    size_t cache_index = (size_t)((session_id >> 2) % WTF_DATAGRAM_SESSION_CACHE_SIZE);
+    wtf_session* cached = (wtf_session*)atomic_load_explicit(
+        &conn->datagram_session_cache[cache_index], memory_order_acquire);
+    if (cached && cached->id == session_id
+        && atomic_load_explicit(&cached->state, memory_order_acquire) == WTF_SESSION_CONNECTED) {
+        return cached;
+    }
+
     mtx_lock(&conn->sessions_mutex);
+    if (conn->destroyed) {
+        mtx_unlock(&conn->sessions_mutex);
+        return NULL;
+    }
 
     session_map_itr itr = session_map_get(&conn->sessions, session_id);
     wtf_session* session = NULL;
@@ -706,10 +725,22 @@ wtf_session* wtf_connection_find_session(wtf_connection* conn, uint64_t session_
         if (session->destroyed) {
             session = NULL;
         } else {
-            wtf_session_add_ref(session);
+            // Retired sessions remain connection-owned until disposal, so replacing a cache
+            // entry cannot leave a dangling pointer while the connection is alive.
+            atomic_store_explicit(&conn->datagram_session_cache[cache_index], (uintptr_t)session,
+                                  memory_order_release);
         }
     }
 
     mtx_unlock(&conn->sessions_mutex);
+    return session;
+}
+
+wtf_session* wtf_connection_find_session(wtf_connection* conn, uint64_t session_id)
+{
+    wtf_session* session = wtf_connection_find_session_borrowed(conn, session_id);
+    if (session) {
+        wtf_session_add_ref(session);
+    }
     return session;
 }

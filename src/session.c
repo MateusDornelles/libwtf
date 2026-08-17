@@ -182,7 +182,7 @@ bool wtf_session_accept_incoming_data(wtf_session* session, uint64_t length)
     uint64_t blocked_limit = 0;
     uint64_t window = session->connection ? session->connection->local_settings.wt_initial_max_data
                                           : 0;
-    mtx_lock(&session->streams_mutex);
+    mtx_lock(&session->flow_mutex);
     if (length <= session->local_max_data
         && session->received_data <= session->local_max_data - length) {
         session->received_data += length;
@@ -210,7 +210,7 @@ bool wtf_session_accept_incoming_data(wtf_session* session, uint64_t length)
     } else {
         blocked_limit = session->local_max_data;
     }
-    mtx_unlock(&session->streams_mutex);
+    mtx_unlock(&session->flow_mutex);
 
     if (!accepted) {
         wtf_session_send_flow_control_capsule(session, WTF_CAPSULE_WT_DATA_BLOCKED, blocked_limit);
@@ -332,16 +332,19 @@ bool wtf_session_reserve_outgoing_data(wtf_session* session, uint64_t length)
     }
 
     bool reserved = false;
-    mtx_lock(&session->streams_mutex);
+    uint64_t blocked_limit = 0;
+    mtx_lock(&session->flow_mutex);
     if (length <= session->remote_max_data && session->sent_data <= session->remote_max_data - length) {
         session->sent_data += length;
         reserved = true;
+    } else {
+        blocked_limit = session->remote_max_data;
     }
-    mtx_unlock(&session->streams_mutex);
+    mtx_unlock(&session->flow_mutex);
 
     if (!reserved) {
         wtf_session_send_flow_control_capsule(session, WTF_CAPSULE_WT_DATA_BLOCKED,
-                                             session->remote_max_data);
+                                             blocked_limit);
     }
 
     return reserved;
@@ -353,13 +356,13 @@ void wtf_session_release_outgoing_data(wtf_session* session, uint64_t length)
         return;
     }
 
-    mtx_lock(&session->streams_mutex);
+    mtx_lock(&session->flow_mutex);
     if (session->sent_data >= length) {
         session->sent_data -= length;
     } else {
         session->sent_data = 0;
     }
-    mtx_unlock(&session->streams_mutex);
+    mtx_unlock(&session->flow_mutex);
 }
 
 void wtf_session_add_ref(wtf_session* session)
@@ -408,6 +411,7 @@ void wtf_session_release(wtf_session* session)
 
     wtf_connection* conn = session->connection;
     session->connection = NULL;
+    mtx_destroy(&session->flow_mutex);
     mtx_destroy(&session->streams_mutex);
     free(session);
     wtf_connection_release(conn);
@@ -511,13 +515,13 @@ bool wtf_session_process_capsule(wtf_session* session, const wtf_capsule* capsul
             }
 
             bool valid = true;
-            mtx_lock(&session->streams_mutex);
+            mtx_lock(&session->flow_mutex);
             if (max_data < session->remote_max_data) {
                 valid = false;
             } else {
                 session->remote_max_data = max_data;
             }
-            mtx_unlock(&session->streams_mutex);
+            mtx_unlock(&session->flow_mutex);
 
             if (!valid) {
                 WTF_LOG_ERROR(session->connection->context, "flow",
@@ -690,6 +694,13 @@ wtf_session* wtf_session_create(wtf_connection* conn, wtf_http3_stream* connect_
     stream_map_init(&session->streams);
 
     if (mtx_init(&session->streams_mutex, mtx_plain) != thrd_success) {
+        stream_map_cleanup(&session->streams);
+        free(session);
+        return NULL;
+    }
+
+    if (mtx_init(&session->flow_mutex, mtx_plain) != thrd_success) {
+        mtx_destroy(&session->streams_mutex);
         stream_map_cleanup(&session->streams);
         free(session);
         return NULL;
@@ -886,9 +897,8 @@ static wtf_result_t wtf_session_send_datagram_internal(wtf_session* session,
     if (total_buffer_count <= WTF_INLINE_SEND_BUFFERS) {
         send_ctx->buffers = send_ctx->inline_buffers;
         send_ctx->buffers_inline = true;
-        memset(send_ctx->inline_buffers, 0, sizeof(send_ctx->inline_buffers));
     } else {
-        send_ctx->buffers = calloc(total_buffer_count, sizeof(wtf_buffer_t));
+        send_ctx->buffers = malloc(total_buffer_count * sizeof(wtf_buffer_t));
         if (!send_ctx->buffers) {
             result = WTF_ERROR_OUT_OF_MEMORY;
             goto cleanup;
@@ -901,7 +911,6 @@ static wtf_result_t wtf_session_send_datagram_internal(wtf_session* session,
     wtf_session_add_ref(session);
     send_ctx->owns_session_ref = true;
     send_ctx->internal_send = false;
-    send_ctx->owns_buffer_data = copy_payload;
     send_ctx->app_buffer_offset = 1;
     send_ctx->operation_context = operation_context;
     send_ctx->count = total_buffer_count;
@@ -916,6 +925,21 @@ static wtf_result_t wtf_session_send_datagram_internal(wtf_session* session,
         goto cleanup;
     }
 
+    uint8_t* copy_storage = NULL;
+    if (copy_payload && total_data_size > 0) {
+        if (total_size <= sizeof(send_ctx->inline_data)) {
+            copy_storage = send_ctx->inline_data + header_size;
+        } else {
+            copy_storage = malloc(total_data_size);
+            if (!copy_storage) {
+                result = WTF_ERROR_OUT_OF_MEMORY;
+                goto cleanup;
+            }
+            send_ctx->owned_buffer_data = copy_storage;
+        }
+    }
+
+    size_t copy_offset = 0;
     for (uint32_t i = 0; i < buffer_count; i++) {
         send_ctx->buffers[i + 1].length = data[i].length;
 
@@ -929,13 +953,9 @@ static wtf_result_t wtf_session_send_datagram_internal(wtf_session* session,
             continue;
         }
 
-        uint8_t* payload_copy = malloc(data[i].length);
-        if (!payload_copy) {
-            result = WTF_ERROR_OUT_OF_MEMORY;
-            goto cleanup;
-        }
-        memcpy(payload_copy, data[i].data, data[i].length);
-        send_ctx->buffers[i + 1].data = payload_copy;
+        memcpy(copy_storage + copy_offset, data[i].data, data[i].length);
+        send_ctx->buffers[i + 1].data = copy_storage + copy_offset;
+        copy_offset += data[i].length;
     }
 
     QUIC_STATUS status = conn->context->quic_api->DatagramSend(

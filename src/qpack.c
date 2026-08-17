@@ -5,6 +5,66 @@
 #include "utils.h"
 
 #define WTF_MAX_CONNECT_HEADERS 256
+#define WTF_HEADER_STORAGE_BLOCK_SIZE 4096
+
+struct wtf_header_storage_block {
+    struct wtf_header_storage_block* next;
+    size_t capacity;
+    size_t used;
+    char data[];
+};
+
+static char* wtf_header_storage_copy(wtf_header_storage* storage, const char* value, size_t length)
+{
+    if (!storage || !value || length == SIZE_MAX) {
+        return NULL;
+    }
+
+    size_t required = length + 1;
+    char* destination = NULL;
+    if (required <= sizeof(storage->inline_data) - storage->inline_used) {
+        destination = storage->inline_data + storage->inline_used;
+        storage->inline_used += required;
+    } else {
+        wtf_header_storage_block* block = storage->blocks;
+        if (!block || required > block->capacity - block->used) {
+            size_t capacity = max(required, (size_t)WTF_HEADER_STORAGE_BLOCK_SIZE);
+            if (capacity > SIZE_MAX - sizeof(*block)) {
+                return NULL;
+            }
+            block = malloc(sizeof(*block) + capacity);
+            if (!block) {
+                return NULL;
+            }
+            block->next = storage->blocks;
+            block->capacity = capacity;
+            block->used = 0;
+            storage->blocks = block;
+        }
+        destination = block->data + block->used;
+        block->used += required;
+    }
+
+    memcpy(destination, value, length);
+    destination[length] = '\0';
+    return destination;
+}
+
+static void wtf_header_storage_cleanup(wtf_header_storage* storage)
+{
+    if (!storage) {
+        return;
+    }
+
+    wtf_header_storage_block* block = storage->blocks;
+    while (block) {
+        wtf_header_storage_block* next = block->next;
+        free(block);
+        block = next;
+    }
+    storage->blocks = NULL;
+    storage->inline_used = 0;
+}
 
 static void wtf_qpack_unblocked(void* context WTF_MAYBE_UNUSED)
 {
@@ -55,16 +115,14 @@ static bool validate_header_size(wtf_header_decode_context* ctx, size_t name_len
     return true;
 }
 
-static bool update_request_field(char** field, const char* value, size_t value_len)
+static bool update_request_field(wtf_connect_request* request, char** field, const char* value,
+                                 size_t value_len)
 {
-    char* copy = wtf_strndup(value, value_len);
+    char* copy = wtf_header_storage_copy(&request->storage, value, value_len);
     if (!copy) {
         return false;
     }
 
-    if (*field) {
-        free(*field);
-    }
     *field = copy;
     return true;
 }
@@ -86,7 +144,7 @@ static bool update_pseudo_field(wtf_header_decode_context* ctx, char** field, bo
     }
 
     *seen = true;
-    return update_request_field(field, value, value_len);
+    return update_request_field(ctx->request, field, value, value_len);
 }
 
 static bool process_pseudo_header(wtf_header_decode_context* ctx, const char* name,
@@ -179,7 +237,8 @@ static bool process_regular_header(wtf_header_decode_context* ctx, const char* n
             ctx->malformed_header_block = true;
             return false;
         }
-        return update_request_field(&request->origin, value, value_len);
+        request->origin = (char*)request->headers[request->header_count - 1].value;
+        return true;
     }
 
     return true;
@@ -252,11 +311,9 @@ static bool wtf_connect_request_add_header(wtf_connect_request* request, const c
         request->header_capacity = new_capacity;
     }
 
-    char* header_name = wtf_strndup(name, name_len);
-    char* header_value = wtf_strndup(value, value_len);
+    char* header_name = wtf_header_storage_copy(&request->storage, name, name_len);
+    char* header_value = wtf_header_storage_copy(&request->storage, value, value_len);
     if (!header_name || !header_value) {
-        free(header_name);
-        free(header_value);
         if (log_ctx) {
             WTF_LOG_ERROR(log_ctx, "qpack", "Failed to copy CONNECT header");
         }
@@ -299,11 +356,9 @@ static bool wtf_connect_response_add_header(wtf_connect_response* response, cons
         response->header_capacity = new_capacity;
     }
 
-    char* header_name = wtf_strndup(name, name_len);
-    char* header_value = wtf_strndup(value, value_len);
+    char* header_name = wtf_header_storage_copy(&response->storage, name, name_len);
+    char* header_value = wtf_header_storage_copy(&response->storage, value, value_len);
     if (!header_name || !header_value) {
-        free(header_name);
-        free(header_value);
         if (log_ctx) {
             WTF_LOG_ERROR(log_ctx, "qpack", "Failed to copy CONNECT response header");
         }
@@ -396,8 +451,8 @@ static bool process_response_header(wtf_header_decode_context* ctx, const char* 
             ctx->malformed_header_block = true;
             return false;
         }
-        response->draft_header = wtf_strndup(value, value_len);
-        return response->draft_header != NULL;
+        response->draft_header = (char*)response->headers[response->header_count - 1].value;
+        return true;
     }
 
     return true;
@@ -613,18 +668,8 @@ void wtf_connect_request_cleanup(wtf_connect_request* request)
         return;
     }
 
-    free(request->method);
-    free(request->protocol);
-    free(request->scheme);
-    free(request->authority);
-    free(request->path);
-    free(request->origin);
-
-    for (size_t i = 0; i < request->header_count; i++) {
-        free((void*)request->headers[i].name);
-        free((void*)request->headers[i].value);
-    }
     free(request->headers);
+    wtf_header_storage_cleanup(&request->storage);
 
     memset(request, 0, sizeof(*request));
 }
@@ -635,13 +680,8 @@ void wtf_connect_response_cleanup(wtf_connect_response* response)
         return;
     }
 
-    free(response->draft_header);
-
-    for (size_t i = 0; i < response->header_count; i++) {
-        free((void*)response->headers[i].name);
-        free((void*)response->headers[i].value);
-    }
     free(response->headers);
+    wtf_header_storage_cleanup(&response->storage);
 
     memset(response, 0, sizeof(*response));
 }

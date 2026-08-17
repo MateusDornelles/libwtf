@@ -50,6 +50,7 @@ endif()
 
 option(WTF_BUILD_TESTS "Build tests" OFF)
 option(WTF_BUILD_SAMPLES "Build sample applications" OFF)
+option(WTF_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 option(WTF_ENABLE_LOGGING "Enable logging support" ON)
 option(WTF_USE_EXTERNAL_MSQUIC "Use an external msquic installation" OFF)
 option(WTF_APPLY_BUNDLED_MSQUIC_PATCHES "Apply libwtf patches to the bundled msquic submodule" ON)
@@ -118,11 +119,6 @@ else()
         $<$<CONFIG:Debug>:-O0>
         $<$<CONFIG:Debug>:-DDEBUG>
         $<$<CONFIG:Debug>:-fno-omit-frame-pointer>
-        $<$<CONFIG:Release>:-O2>
-        $<$<CONFIG:Release>:-DNDEBUG>
-        $<$<CONFIG:RelWithDebInfo>:-O2>
-        $<$<CONFIG:RelWithDebInfo>:-g>
-        $<$<CONFIG:RelWithDebInfo>:-DNDEBUG>
     )
     
     if(APPLE)
@@ -387,7 +383,6 @@ target_compile_definitions(wtf PRIVATE WTF_EXPORTS)
 
 if(NOT WIN32)
     target_compile_options(wtf PRIVATE -fvisibility=hidden)
-    target_compile_options(wtf PRIVATE -fvisibility-inlines-hidden)
     set_target_properties(wtf PROPERTIES
         C_VISIBILITY_PRESET hidden
         CXX_VISIBILITY_PRESET hidden
@@ -420,6 +415,10 @@ endif()
 if(WTF_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(WTF_BUILD_BENCHMARKS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks")
+    add_subdirectory(benchmarks)
 endif()
 
 include(GNUInstallDirs)

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <cstdint>
 
 extern "C" {
@@ -53,4 +54,39 @@ TEST(Utils, ProvidesStableResultStrings)
     EXPECT_STREQ(wtf_result_to_string(WTF_SUCCESS), "Success");
     EXPECT_STREQ(wtf_result_to_string(WTF_ERROR_INVALID_PARAMETER), "Invalid parameter");
     EXPECT_STREQ(wtf_result_to_string(static_cast<wtf_result_t>(9999)), "Unknown error");
+}
+
+TEST(Utils, InternalSendContextKeepsSmallCopiesInline)
+{
+    uint8_t payload[WTF_INLINE_SEND_STORAGE];
+    std::memset(payload, 0x5a, sizeof(payload));
+
+    wtf_internal_send_context* context = nullptr;
+    ASSERT_EQ(WTF_SUCCESS,
+              wtf_internal_send_context_create_copy(payload, sizeof(payload), &context));
+    ASSERT_NE(context, nullptr);
+    ASSERT_EQ(context->count, 1u);
+    EXPECT_EQ(context->buffers, context->inline_buffers);
+    EXPECT_EQ(context->buffers[0].data, context->inline_data);
+    EXPECT_EQ(context->owned_buffer_data, nullptr);
+    EXPECT_EQ(std::memcmp(context->buffers[0].data, payload, sizeof(payload)), 0);
+
+    wtf_internal_send_context_destroy(context);
+}
+
+TEST(Utils, InternalSendContextUsesOneOwnedAllocationForLargeCopies)
+{
+    uint8_t payload[WTF_INLINE_SEND_STORAGE + 1];
+    std::memset(payload, 0xa5, sizeof(payload));
+
+    wtf_internal_send_context* context = nullptr;
+    ASSERT_EQ(WTF_SUCCESS,
+              wtf_internal_send_context_create_copy(payload, sizeof(payload), &context));
+    ASSERT_NE(context, nullptr);
+    ASSERT_NE(context->owned_buffer_data, nullptr);
+    EXPECT_EQ(context->buffers[0].data, context->owned_buffer_data);
+    EXPECT_NE(context->buffers[0].data, context->inline_data);
+    EXPECT_EQ(std::memcmp(context->buffers[0].data, payload, sizeof(payload)), 0);
+
+    wtf_internal_send_context_destroy(context);
 }

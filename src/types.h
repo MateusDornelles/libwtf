@@ -3,10 +3,22 @@
 #include <lsqpack.h>
 #include <lsxpack_header.h>
 #include <msquic.h>
-#include <stdatomic.h>
 #include <tinycthread.h>
 
 #include "wtf.h"
+
+#ifdef __cplusplus
+typedef unsigned int wtf_atomic_uint;
+typedef bool wtf_atomic_bool;
+typedef uintptr_t wtf_atomic_uintptr;
+typedef wtf_session_state_t wtf_atomic_session_state;
+#else
+    #include <stdatomic.h>
+typedef atomic_uint wtf_atomic_uint;
+typedef atomic_bool wtf_atomic_bool;
+typedef atomic_uintptr_t wtf_atomic_uintptr;
+typedef _Atomic(wtf_session_state_t) wtf_atomic_session_state;
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,6 +42,8 @@ extern "C" {
 #define WTF_INLINE_SEND_BUFFERS 4
 #define WTF_INLINE_SEND_STORAGE 128
 #define WTF_INLINE_CAPSULE_STORAGE 32
+#define WTF_HEADER_STORAGE_INLINE 1024
+#define WTF_DATAGRAM_SESSION_CACHE_SIZE 16
 #define WTF_MAX_DATAGRAM_SIZE 65536
 #define WTF_MAX_STREAM_BUFFER_SIZE (1024 * 1024)
 #define WTF_MAX_CONNECT_RESPONSE_HEADERS 32
@@ -118,6 +132,7 @@ typedef struct wtf_connection_request_handle wtf_connection_request_handle;
 typedef struct wtf_header_decode_context wtf_header_decode_context;
 typedef struct wtf_send_context wtf_send_context;
 typedef struct wtf_capsule wtf_capsule;
+typedef struct wtf_header_storage_block wtf_header_storage_block;
 
 #if defined(__cplusplus)
     #define WTF_STATIC_ASSERT static_assert
@@ -201,6 +216,12 @@ typedef struct wtf_capsule {
     uint8_t* data;
 } wtf_capsule;
 
+typedef struct wtf_header_storage {
+    wtf_header_storage_block* blocks;
+    size_t inline_used;
+    char inline_data[WTF_HEADER_STORAGE_INLINE];
+} wtf_header_storage;
+
 typedef struct wtf_qpack_context {
     struct lsqpack_enc encoder;
     struct lsqpack_dec decoder;
@@ -266,6 +287,7 @@ typedef struct wtf_connect_request {
     wtf_http_header_t* headers;
     size_t header_count;
     size_t header_capacity;
+    wtf_header_storage storage;
     bool valid;
 } wtf_connect_request;
 
@@ -275,11 +297,12 @@ typedef struct wtf_connect_response {
     wtf_http_header_t* headers;
     size_t header_count;
     size_t header_capacity;
+    wtf_header_storage storage;
     bool valid;
 } wtf_connect_response;
 
 typedef struct wtf_connection_request_handle {
-    atomic_uint ref_count;
+    wtf_atomic_uint ref_count;
     bool completed;
     wtf_http3_stream* stream;
     wtf_connection_response_t response;
@@ -287,7 +310,7 @@ typedef struct wtf_connection_request_handle {
 } wtf_connection_request_handle;
 
 typedef struct wtf_stream {
-    atomic_uint ref_count;
+    wtf_atomic_uint ref_count;
     bool destroyed;
     HQUIC quic_stream;
     uint64_t stream_id;
@@ -305,7 +328,7 @@ typedef struct wtf_stream {
 } wtf_stream;
 
 typedef struct wtf_http3_stream {
-    atomic_uint ref_count;
+    wtf_atomic_uint ref_count;
     bool destroyed;
     uint64_t id;
     HQUIC quic_stream;
@@ -341,11 +364,11 @@ typedef struct wtf_http3_stream {
 } wtf_http3_stream;
 
 typedef struct wtf_session {
-    atomic_uint ref_count;
+    wtf_atomic_uint ref_count;
     bool destroyed;
     wtf_connection* connection;
     wtf_http3_stream* connect_stream;
-    wtf_session_state_t state;
+    wtf_atomic_session_state state;
     uint64_t id;
     struct wtf_session* next_closed;
     bool retired;
@@ -368,6 +391,7 @@ typedef struct wtf_session {
     uint64_t remote_max_data;
     uint64_t received_data;
     uint64_t sent_data;
+    mtx_t flow_mutex;
     mtx_t streams_mutex;
 
     uint32_t close_error_code;
@@ -375,7 +399,7 @@ typedef struct wtf_session {
 } wtf_session;
 
 typedef struct wtf_connection {
-    atomic_uint ref_count;
+    wtf_atomic_uint ref_count;
     bool destroyed;
     uint64_t id;
     HQUIC quic_connection;
@@ -384,8 +408,9 @@ typedef struct wtf_connection {
     wtf_server* server;
     wtf_client* client;
     wtf_connection_state_t state;
-    atomic_bool datagram_send_enabled;
-    atomic_uint max_datagram_size;
+    wtf_atomic_bool datagram_send_enabled;
+    wtf_atomic_uint max_datagram_size;
+    wtf_atomic_uintptr datagram_session_cache[WTF_DATAGRAM_SESSION_CACHE_SIZE];
 
     wtf_settings local_settings;
     wtf_settings peer_settings;
@@ -487,13 +512,13 @@ typedef struct {
     wtf_session* session;
     uint64_t flow_control_length;
     bool internal_send;
-    bool owns_buffer_data;
     bool buffers_inline;
     bool owns_session_ref;
     uint32_t app_buffer_offset;
     void* operation_context;
     wtf_buffer_t inline_buffers[WTF_INLINE_SEND_BUFFERS];
     uint8_t inline_data[WTF_INLINE_SEND_STORAGE];
+    uint8_t* owned_buffer_data;
 } wtf_internal_send_context;
 
 #ifdef __cplusplus

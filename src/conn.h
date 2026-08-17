@@ -13,6 +13,7 @@ void wtf_connection_destroy(wtf_connection* conn);
 void wtf_connection_add_ref(wtf_connection* conn);
 void wtf_connection_release(wtf_connection* conn);
 wtf_session* wtf_connection_find_session(wtf_connection* conn, uint64_t session_id);
+wtf_session* wtf_connection_find_session_borrowed(wtf_connection* conn, uint64_t session_id);
 bool wtf_connection_uses_webtransport_flow_control(const wtf_connection* conn);
 
 bool wtf_connection_associate_stream_with_session(wtf_connection* conn, wtf_http3_stream* h3_stream,

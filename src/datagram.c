@@ -62,7 +62,7 @@ void wtf_datagram_process(wtf_connection* conn, const uint8_t* data, size_t data
         wtf_datagram_shutdown_connection(conn, WTF_H3_DATAGRAM_ERROR);
         return;
     }
-    wtf_session* session = wtf_connection_find_session(conn, stream_id);
+    wtf_session* session = wtf_connection_find_session_borrowed(conn, stream_id);
     if (!session) {
         WTF_LOG_TRACE(conn->context, "datagram", "Dropping datagram for unknown session %llu",
                       (unsigned long long)stream_id);
@@ -72,5 +72,4 @@ void wtf_datagram_process(wtf_connection* conn, const uint8_t* data, size_t data
     const uint8_t* payload = data + offset;
     size_t payload_len = data_len - offset;
     wtf_session_process_datagram(session, payload, payload_len);
-    wtf_session_release(session);
 }

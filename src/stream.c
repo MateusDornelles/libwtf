@@ -154,7 +154,6 @@ static wtf_result_t wtf_stream_send_header(wtf_stream* stream, HQUIC Stream, QUI
     send_ctx->count = 1;
     send_ctx->session = stream->session;
     send_ctx->internal_send = true;
-    send_ctx->owns_buffer_data = false;
     send_ctx->buffers_inline = true;
     send_ctx->app_buffer_offset = 0;
     send_ctx->operation_context = NULL;
@@ -661,18 +660,14 @@ static wtf_result_t wtf_stream_validate_send_params(wtf_stream* stream, const wt
     return WTF_SUCCESS;
 }
 
-static void wtf_stream_free_prepared_buffers(wtf_internal_send_context* send_ctx,
-                                             uint32_t buffer_count, bool owns_buffer_data)
+static void wtf_stream_free_prepared_buffers(wtf_internal_send_context* send_ctx)
 {
     if (!send_ctx || !send_ctx->buffers) {
         return;
     }
 
-    if (owns_buffer_data) {
-        for (uint32_t i = 0; i < buffer_count; i++) {
-            free((void*)send_ctx->buffers[i].data);
-        }
-    }
+    free(send_ctx->owned_buffer_data);
+    send_ctx->owned_buffer_data = NULL;
     if (!send_ctx->buffers_inline) {
         free(send_ctx->buffers);
     }
@@ -686,25 +681,44 @@ static wtf_result_t wtf_stream_prepare_send_buffers(const wtf_buffer_t* buffers,
                                                     wtf_internal_send_context* send_ctx,
                                                     uint64_t* total_length)
 {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < buffer_count; i++) {
+        if (total > UINT64_MAX - buffers[i].length) {
+            return WTF_ERROR_INVALID_PARAMETER;
+        }
+        total += buffers[i].length;
+    }
+
     if (buffer_count <= WTF_INLINE_SEND_BUFFERS) {
         send_ctx->buffers = send_ctx->inline_buffers;
         send_ctx->buffers_inline = true;
-        memset(send_ctx->inline_buffers, 0, sizeof(send_ctx->inline_buffers));
     } else {
-        send_ctx->buffers = calloc(buffer_count, sizeof(wtf_buffer_t));
+        send_ctx->buffers = malloc(buffer_count * sizeof(wtf_buffer_t));
         if (!send_ctx->buffers) {
             return WTF_ERROR_OUT_OF_MEMORY;
         }
     }
 
-    uint64_t total = 0;
-    for (uint32_t i = 0; i < buffer_count; i++) {
-        if (total > UINT64_MAX - buffers[i].length) {
-            wtf_stream_free_prepared_buffers(send_ctx, buffer_count, copy_payload);
-            return WTF_ERROR_INVALID_PARAMETER;
+    uint8_t* copy_storage = NULL;
+    if (copy_payload && total > 0) {
+        if (total <= sizeof(send_ctx->inline_data)) {
+            copy_storage = send_ctx->inline_data;
+        } else {
+            if (total > SIZE_MAX) {
+                wtf_stream_free_prepared_buffers(send_ctx);
+                return WTF_ERROR_INVALID_PARAMETER;
+            }
+            copy_storage = malloc((size_t)total);
+            if (!copy_storage) {
+                wtf_stream_free_prepared_buffers(send_ctx);
+                return WTF_ERROR_OUT_OF_MEMORY;
+            }
+            send_ctx->owned_buffer_data = copy_storage;
         }
-        total += buffers[i].length;
+    }
 
+    size_t copy_offset = 0;
+    for (uint32_t i = 0; i < buffer_count; i++) {
         send_ctx->buffers[i].length = buffers[i].length;
         if (buffers[i].length == 0) {
             send_ctx->buffers[i].data = copy_payload ? NULL : buffers[i].data;
@@ -716,14 +730,9 @@ static wtf_result_t wtf_stream_prepare_send_buffers(const wtf_buffer_t* buffers,
             continue;
         }
 
-        uint8_t* data_copy = malloc(buffers[i].length);
-        if (!data_copy) {
-            wtf_stream_free_prepared_buffers(send_ctx, buffer_count, true);
-            return WTF_ERROR_OUT_OF_MEMORY;
-        }
-
-        memcpy(data_copy, buffers[i].data, buffers[i].length);
-        send_ctx->buffers[i].data = data_copy;
+        memcpy(copy_storage + copy_offset, buffers[i].data, buffers[i].length);
+        send_ctx->buffers[i].data = copy_storage + copy_offset;
+        copy_offset += buffers[i].length;
     }
 
     *total_length = total;
@@ -755,7 +764,6 @@ static wtf_result_t wtf_stream_send_internal(wtf_stream* stream, const wtf_buffe
     send_ctx->count = buffer_count;
     send_ctx->session = stream->session;
     send_ctx->internal_send = false;
-    send_ctx->owns_buffer_data = copy_payload;
     send_ctx->app_buffer_offset = 0;
     send_ctx->operation_context = operation_context;
 
@@ -765,7 +773,7 @@ static wtf_result_t wtf_stream_send_internal(wtf_stream* stream, const wtf_buffe
     }
 
     if (!wtf_session_reserve_outgoing_data(stream->session, total_length)) {
-        wtf_stream_free_prepared_buffers(send_ctx, buffer_count, copy_payload);
+        wtf_stream_free_prepared_buffers(send_ctx);
         free(send_ctx);
         return WTF_ERROR_FLOW_CONTROL;
     }
@@ -784,7 +792,7 @@ static wtf_result_t wtf_stream_send_internal(wtf_stream* stream, const wtf_buffe
         return WTF_SUCCESS;
     }
 
-    wtf_stream_free_prepared_buffers(send_ctx, buffer_count, copy_payload);
+    wtf_stream_free_prepared_buffers(send_ctx);
     free(send_ctx);
     wtf_session_release_outgoing_data(stream->session, total_length);
     return wtf_quic_status_to_result(status);

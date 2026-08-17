@@ -451,14 +451,13 @@ wtf_result_t wtf_internal_send_context_create(size_t length, wtf_internal_send_c
     uint8_t* payload = NULL;
     if (length <= WTF_INLINE_SEND_STORAGE) {
         payload = ctx->inline_data;
-        ctx->owns_buffer_data = false;
     } else {
         payload = malloc(length);
         if (!payload) {
             free(ctx);
             return WTF_ERROR_OUT_OF_MEMORY;
         }
-        ctx->owns_buffer_data = true;
+        ctx->owned_buffer_data = payload;
     }
 
     ctx->buffers[0].data = payload;
@@ -515,10 +514,9 @@ wtf_result_t wtf_internal_send_context_take_buffer(uint8_t* data, size_t length,
         }
         free(data);
         ctx->buffers[0].data = ctx->inline_data;
-        ctx->owns_buffer_data = false;
     } else {
         ctx->buffers[0].data = data;
-        ctx->owns_buffer_data = true;
+        ctx->owned_buffer_data = data;
     }
 
     *send_ctx = ctx;
@@ -532,24 +530,11 @@ void wtf_internal_send_context_destroy(wtf_internal_send_context* send_ctx)
     }
 
     if (send_ctx->buffers) {
-        uint32_t app_offset = send_ctx->app_buffer_offset;
-        if (app_offset > send_ctx->count) {
-            app_offset = send_ctx->count;
-        }
-
-        if (send_ctx->owns_buffer_data) {
-            for (uint32_t i = app_offset; i < send_ctx->count; i++) {
-                const uint8_t* payload = send_ctx->buffers[i].data;
-                if (payload && payload != send_ctx->inline_data) {
-                    free((void*)payload);
-                }
-            }
-        }
-
         if (!send_ctx->buffers_inline) {
             free(send_ctx->buffers);
         }
     }
 
+    free(send_ctx->owned_buffer_data);
     free(send_ctx);
 }
