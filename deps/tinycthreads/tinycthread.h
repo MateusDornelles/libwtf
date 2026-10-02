@@ -463,8 +463,17 @@ typedef struct {
         0,                                                                                                             \
     }
 #else
-#define once_flag pthread_once_t
+/* glibc 2.43+ exposes C23 once_flag/call_once via <stdlib.h> even under C11.
+ * A macro like `#define once_flag pthread_once_t` rewrites that typedef into
+ * `typedef __once_flag pthread_once_t` and breaks the build. Prefer libc. */
+#include <stdlib.h>
+#ifdef __once_flag_defined
+/* once_flag, ONCE_FLAG_INIT, and call_once come from the C library. */
+#else
+typedef pthread_once_t once_flag;
 #define ONCE_FLAG_INIT PTHREAD_ONCE_INIT
+#define call_once(flag, func) ((void)pthread_once((flag), (func)))
+#endif
 #endif
 
 /** Invoke a callback exactly once
@@ -474,8 +483,8 @@ typedef struct {
  */
 #if defined(_TTHREAD_WIN32_)
 void call_once(once_flag *flag, void (*func)(void));
-#else
-#define call_once(flag, func) pthread_once(flag, func)
+#elif !defined(__once_flag_defined)
+/* POSIX call_once macro is defined above when libc does not provide it. */
 #endif
 
 #ifdef __cplusplus
